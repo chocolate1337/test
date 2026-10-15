@@ -8,20 +8,25 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.db import SessionLocal
-from app.models import Outbox
+from app.models.outbox import Outbox
 from app.rabbit import QUEUE_NEW, payments_exchange
 
 logger = logging.getLogger(__name__)
 
 
 async def publish_one(session: AsyncSession, broker: RabbitBroker) -> bool:
-    row = await session.scalar(
+    stmt = (
         select(Outbox)
         .where(Outbox.published_at.is_(None))
         .order_by(Outbox.created_at)
         .limit(1)
-        .with_for_update(skip_locked=True)
     )
+    bind = session.bind
+    if bind is not None and bind.dialect.name == "postgresql":
+        stmt = stmt.with_for_update(skip_locked=True)
+    else:
+        stmt = stmt.with_for_update()
+    row = await session.scalar(stmt)
     if row is None:
         await session.rollback()
         return False

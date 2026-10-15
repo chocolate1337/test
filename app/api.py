@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth import require_api_key
 from app.db import get_db
 from app.payments import IdempotencyConflict, create_payment, get_payment, to_out
-from app.schemas import PaymentAccepted, PaymentCreate, PaymentOut
+from app.schemas.payment import PaymentAccepted, PaymentCreate, PaymentOut
 
 router = APIRouter(
     prefix="/api/v1/payments",

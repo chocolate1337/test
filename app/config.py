@@ -19,6 +19,8 @@ class Settings(BaseSettings):
 
     webhook_timeout: float = 10.0
     webhook_attempts: int = 3
+    webhook_claim_ttl_seconds: float = 45.0
+    webhook_inflight_nack_delay_seconds: float = 1.0
 
 
 settings = Settings()

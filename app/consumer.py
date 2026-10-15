@@ -5,18 +5,23 @@ from faststream import FastStream
 from faststream.rabbit import RabbitMessage
 
 from app.config import settings
-from app.process import process_payment
+from app.process import PermanentError, WebhookInFlightError, process_payment
 from app.rabbit import (
-    QUEUE_DLQ,
-    RETRY_TTL_MS,
+    consumer_channel,
     declare_topology,
-    dlx_exchange,
     new_broker,
     new_queue,
     payments_exchange,
     retry_queue_name,
 )
-from app.schemas import PaymentNewEvent
+from app.retry import (
+    MAX_ATTEMPTS,
+    RETRY_HEADER,
+    FailureAction,
+    attempt_from_headers,
+    route_failure,
+)
+from app.schemas.events import PaymentNewEvent
 
 logging.basicConfig(
     level=getattr(logging, settings.log_level.upper(), logging.INFO),
@@ -24,66 +29,65 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-MAX_ATTEMPTS = 3
-RETRY_HEADER = "x-retry-count"
-
 broker = new_broker()
 app = FastStream(broker)
 
 
 @app.on_startup
 async def _topology() -> None:
-    await broker.connect()
-    await declare_topology(broker)
+    await declare_topology(settings.rabbitmq_url)
 
 
-@broker.subscriber(new_queue, payments_exchange)
+@broker.subscriber(new_queue, payments_exchange, no_ack=True, channel=consumer_channel)
 async def on_payment_created(event: PaymentNewEvent, msg: RabbitMessage) -> None:
-    attempt = _attempt_no(msg)
+    attempt = attempt_from_headers(msg.headers)
     logger.info("платёж %s, попытка %s/%s", event.payment_id, attempt, MAX_ATTEMPTS)
     try:
         await process_payment(event.payment_id)
-    except Exception:
+    except Exception as exc:
         logger.exception("ошибка обработки %s, попытка %s", event.payment_id, attempt)
-        await _retry_or_dlq(event, msg, attempt)
+        await settle_failure(event, msg, attempt, exc)
+        return
+    await msg.ack()
 
 
-def _attempt_no(msg: RabbitMessage) -> int:
-    raw = (msg.headers or {}).get(RETRY_HEADER, 0)
+async def settle_failure(event: PaymentNewEvent, msg: RabbitMessage, attempt: int, exc: BaseException) -> None:
+    if isinstance(exc, PermanentError):
+        await msg.reject(requeue=False)
+        logger.error("%s в DLQ без ретрая (%s)", event.payment_id, type(exc).__name__)
+        return
+    if isinstance(exc, WebhookInFlightError):
+        await asyncio.sleep(settings.webhook_inflight_nack_delay_seconds)
+        await msg.nack(requeue=True)
+        logger.info("%s in-flight, nack+requeue", event.payment_id)
+        return
+    await retry_or_dead_letter(event, msg, attempt)
+
+
+async def retry_or_dead_letter(event: PaymentNewEvent, msg: RabbitMessage, attempt: int) -> None:
+    route = route_failure(attempt)
+    if route.action is FailureAction.DEAD_LETTER:
+        await msg.reject(requeue=False)
+        logger.error("%s ушёл в DLQ через reject(requeue=False)", event.payment_id)
+        return
+
+    assert route.retry_ttl_ms is not None
     try:
-        previous = int(raw)
-    except (TypeError, ValueError):
-        previous = 0
-    return max(previous, 0) + 1
-
-
-async def _retry_or_dlq(event: PaymentNewEvent, msg: RabbitMessage, attempt: int) -> None:
-    headers = {**(msg.headers or {}), RETRY_HEADER: attempt}
-    body = event.model_dump(mode="json")
-
-    if attempt >= MAX_ATTEMPTS:
         await broker.publish(
-            body,
-            exchange=dlx_exchange,
-            routing_key=QUEUE_DLQ,
+            event.model_dump(mode="json"),
+            queue=retry_queue_name(route.retry_ttl_ms),
             persist=True,
-            headers=headers,
+            headers={**(msg.headers or {}), RETRY_HEADER: attempt},
             message_id=str(event.payment_id),
             correlation_id=str(event.payment_id),
         )
-        logger.error("%s ушёл в DLQ", event.payment_id)
-        return
+    except Exception:
+        logger.exception("не удалось опубликовать retry для %s, nack+requeue", event.payment_id)
+        await msg.nack(requeue=True)
+        raise
 
-    ttl = RETRY_TTL_MS[attempt - 1]
-    await broker.publish(
-        body,
-        queue=retry_queue_name(ttl),
-        persist=True,
-        headers=headers,
-        message_id=str(event.payment_id),
-        correlation_id=str(event.payment_id),
-    )
-    logger.warning("%s повторим через %s мс", event.payment_id, ttl)
+    await msg.ack()
+    logger.warning("%s повторим через %s мс", event.payment_id, route.retry_ttl_ms)
 
 
 if __name__ == "__main__":

@@ -1,21 +1,26 @@
-"""Rabbit topology.
+"""Топология RabbitMQ объявляется через aio-pika, без приватного API FastStream.
+
+payments (direct, durable)
+  └─ payments.new  (DLX → payments.dlx / payments.new.dlq)
 
 Retry без delayed-plugin: TTL-очереди возвращают сообщение в payments.new.
-После 3 попыток кладём в DLQ руками очередь не читаем, её смотрят в UI.
+После 3-й ошибки consumer делает reject(requeue=False) — брокер кладёт
+исходное сообщение в DLQ. Prefetch=1: один unacked message на consumer.
 """
 
 from aio_pika import ExchangeType as AioExchangeType
-from faststream.rabbit import ExchangeType, RabbitBroker, RabbitExchange, RabbitQueue
+from aio_pika import connect_robust
+from faststream.rabbit import Channel, ExchangeType, RabbitBroker, RabbitExchange, RabbitQueue
 
 from app.config import settings
+from app.retry import RETRY_TTL_MS
 
 EXCHANGE = "payments"
 DLX = "payments.dlx"
 QUEUE_NEW = "payments.new"
 QUEUE_DLQ = "payments.new.dlq"
 
-# попытка 2 через 1s, попытка 3 через 2s
-RETRY_TTL_MS = (1000, 2000)
+consumer_channel = Channel(prefetch_count=1, publisher_confirms=True)
 
 payments_exchange = RabbitExchange(EXCHANGE, type=ExchangeType.DIRECT, durable=True)
 dlx_exchange = RabbitExchange(DLX, type=ExchangeType.DIRECT, durable=True)
@@ -31,35 +36,40 @@ new_queue = RabbitQueue(
 )
 
 
-def new_broker() -> RabbitBroker:
-    return RabbitBroker(settings.rabbitmq_url)
+def new_broker(url: str | None = None) -> RabbitBroker:
+    return RabbitBroker(url or settings.rabbitmq_url, default_channel=consumer_channel)
 
 
 def retry_queue_name(ttl_ms: int) -> str:
     return f"payments.new.retry.{ttl_ms}ms"
 
 
-async def declare_topology(broker: RabbitBroker) -> None:
-    channel = getattr(broker, "_channel", None)
-    owned = False
-    if channel is None:
-        connection = getattr(broker, "_connection", None)
-        if connection is None:
-            raise RuntimeError("нет соединения с RabbitMQ")
-        channel = await connection.channel()
-        owned = True
+def retry_queue_arguments(ttl_ms: int) -> dict:
+    return {
+        "x-message-ttl": ttl_ms,
+        "x-dead-letter-exchange": EXCHANGE,
+        "x-dead-letter-routing-key": QUEUE_NEW,
+    }
 
+
+def main_queue_arguments() -> dict:
+    return {
+        "x-dead-letter-exchange": DLX,
+        "x-dead-letter-routing-key": QUEUE_DLQ,
+    }
+
+
+async def declare_topology(url: str | None = None) -> None:
+    connection = await connect_robust(url or settings.rabbitmq_url)
     try:
+        channel = await connection.channel()
         payments = await channel.declare_exchange(EXCHANGE, AioExchangeType.DIRECT, durable=True)
         dlx = await channel.declare_exchange(DLX, AioExchangeType.DIRECT, durable=True)
 
         incoming = await channel.declare_queue(
             QUEUE_NEW,
             durable=True,
-            arguments={
-                "x-dead-letter-exchange": DLX,
-                "x-dead-letter-routing-key": QUEUE_DLQ,
-            },
+            arguments=main_queue_arguments(),
         )
         await incoming.bind(payments, routing_key=QUEUE_NEW)
 
@@ -70,12 +80,7 @@ async def declare_topology(broker: RabbitBroker) -> None:
             await channel.declare_queue(
                 retry_queue_name(ttl),
                 durable=True,
-                arguments={
-                    "x-message-ttl": ttl,
-                    "x-dead-letter-exchange": EXCHANGE,
-                    "x-dead-letter-routing-key": QUEUE_NEW,
-                },
+                arguments=retry_queue_arguments(ttl),
             )
     finally:
-        if owned:
-            await channel.close()
+        await connection.close()

@@ -27,7 +27,9 @@ services:
       retries: 10
 
   api:
-    build: .
+    build:
+      context: .
+      target: runtime
     env_file:
       - .env
     environment:
@@ -43,7 +45,9 @@ services:
         condition: service_healthy
 
   consumer:
-    build: .
+    build:
+      context: .
+      target: runtime
     env_file:
       - .env
     environment:
@@ -58,6 +62,21 @@ services:
         condition: service_healthy
       api:
         condition: service_started
+
+  test:
+    profiles: ["test"]
+    build:
+      context: .
+      target: test
+    environment:
+      DATABASE_URL: postgresql+asyncpg://payments:payments@postgres:5432/payments
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    command: ["pytest", "-q"]
 
 volumes:
   postgres_data:

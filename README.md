@@ -1,34 +1,45 @@
 # Payments
 
-Тестовое: асинхронный сервис оплаты.
+Асинхронный сервис оплаты: HTTP API принимает платёж, в одной транзакции пишет `payments` + `outbox`, relay публикует в RabbitMQ, один consumer эмулирует эквайринг и вызывает webhook.
 
-Принимает платёж по HTTP, кладёт его в Postgres вместе с outbox-записью, из outbox событие уходит в Rabbit (`payments.new`). Отдельный consumer эмулирует эквайринг (2-5 сек, около 90% успеха) и дергает webhook.
-
-Суммы в рублях, два знака после запятой. `currency` по умолчанию `RUB`. USD/EUR в API тоже есть, просто не акцентировал.
-
-## Как запустить
-
-Нужны docker и compose.
+## Запуск
 
 ```bash
 cp .env.example .env
 docker compose up --build
 ```
 
-Поднятие в первый раз чуть подождёт postgres/rabbit.
+| Сервис | URL |
+|--------|-----|
+| API / OpenAPI | http://localhost:8000/docs |
+| RabbitMQ UI | http://localhost:15673 (guest / guest) |
+| Postgres с хоста | localhost:5433 |
 
-- swagger: http://localhost:8000/docs
-- rabbit management: http://localhost:15673 (guest / guest)
+Порты с хоста: `5433`, `5673`, `15673` — чтобы не пересекаться с локальными инстансами. Внутри сети compose — `postgres:5432` и `rabbitmq:5672`.
 
-Порты с хоста специально не стандартные: postgres `5433`, amqp `5673`, ui `15673`. У меня локально 5432/5672 уже были заняты. Внутри сети контейнеров всё как обычно, `postgres:5432` и `rabbitmq:5672`.
+`docker compose down` останавливает стек. Volume с базой сохраняется.
 
-Остановить: `docker compose down`. Volume с базой останется.
+## Тесты
+
+```bash
+python -m venv .venv
+.venv/Scripts/activate   # Windows
+pip install -r requirements.txt -r requirements-dev.txt
+pytest -q
+```
+
+- `pytest -q` — unit на SQLite; integration пропускаются, если нет `DATABASE_URL` / `RABBITMQ_URL`
+- живые Postgres + RabbitMQ:
+
+```bash
+docker compose --profile test run --rm test
+```
+
+CI: `.github/workflows/test.yml` гоняет unit и integration на каждый push.
 
 ## API
 
-На всех эндпоинтах нужен заголовок `X-API-Key`. В `.env` лежит `dev-api-key`, если не меняли.
-
-На создании ещё нужен `Idempotency-Key`. Без него 422. Повтор с тем же ключом и тем же телом вернёт тот же платёж, если тело другое то 409.
+`X-API-Key` обязателен на **всех** HTTP-запросах, включая `/health`, `/docs` и `/openapi.json`. Создание платежа — ещё `Idempotency-Key`: тот же ключ и тело → тот же платёж (`202`), другое тело → `409`.
 
 ```bash
 curl -s -X POST http://localhost:8000/api/v1/payments \
@@ -43,34 +54,29 @@ curl -s -X POST http://localhost:8000/api/v1/payments \
   }'
 ```
 
-Ответ 202, в теле `payment_id` и `pending`. Потом:
+Ответ `202`: `payment_id`, `pending`, `created_at`. Через 2–5 секунд `GET /api/v1/payments/{id}` вернёт `succeeded` или `failed`.
 
-```bash
-curl -s http://localhost:8000/api/v1/payments/<payment_id> \
-  -H "X-API-Key: dev-api-key"
-```
+## Гарантии доставки
 
-Статус меняется через пару секунд на `succeeded` или `failed`.
+**Outbox.** Платёж и событие в одной транзакции. Relay держит `FOR UPDATE SKIP LOCKED` до успешного publish и только потом ставит `published_at`. Если брокер недоступен, commit не будет — строка unpublished. Если publish прошёл, а commit нет, возможна повторная публикация; consumer идемпотентен.
 
-Для webhook я обычно подставляю url с webhook.site, так проще увидеть payload.
+**Шлюз.** Исход стабилен по `payment_id` (доля успеха ~90%): повтор после аварии между ответом шлюза и `UPDATE` не меняет результат. Терминальный статус не перезаписывается.
 
-## Очереди / ретраи
+**Webhook.** CAS-claim → HTTP → CAS `webhook_sent_at`. Параллельный воркер получает `WebhookInFlightError` и делает `nack(requeue=True)` без сжигания retry-бюджета. Свежий claim чужой воркер не перехватывает; протухший (крэш, TTL 45s) — можно забрать. Клиент webhook должен быть идемпотентен по `payment_id` на случай крэша после HTTP и до `webhook_sent_at`.
 
-Outbox крутится фоном в api-процессе: читает неопубликованное, `SKIP LOCKED`, публикует, пишет `published_at`.
+**Retry / DLQ.** Ошибки обработки: попытки 1–2 в TTL-очередь, третья — `reject(requeue=False)` в `payments.new.dlq`. Нет платежа в БД — сразу DLQ, без ретраев. Prefetch = 1.
 
-Consumer один. Если обработка упала (в основном это webhook), сообщение уходит в ttl-очередь: сначала 1с, потом 2с. После третьей попытки в `payments.new.dlq`. Эту очередь никто не читает, смотреть в management UI.
+**Один consumer.** Один процесс, `Channel(prefetch_count=1)`.
 
-Сам webhook ретраится отдельно, тоже три раза.
+## Очереди
 
-Повторная доставка из кролика шлюз второй раз не дергает, если платёж уже не `pending`. Webhook при этом может уйти ещё раз, пока не проставится `webhook_sent_at`.
+| Очередь | Роль |
+|---------|------|
+| `payments.new` | входящие, DLX → DLQ |
+| `payments.new.retry.1000ms` | повтор через 1s |
+| `payments.new.retry.2000ms` | повтор через 2s |
+| `payments.new.dlq` | окончательно упавшие, никто не читает |
 
 ## Конфиг
 
-Всё через env, шаблон в `.env.example`:
-
-- `API_KEY`
-- `DATABASE_URL`
-- `RABBITMQ_URL`
-- `LOG_LEVEL`
-
-В compose для api/consumer url'ы на сервисы переопределяются, так что локальный `.env` с `localhost` на работу в докере не влияет.
+`.env.example`: `API_KEY`, `DATABASE_URL`, `RABBITMQ_URL`, `LOG_LEVEL`. Compose для api/consumer подставляет URL сервисов сам.
