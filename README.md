@@ -1,5 +1,3 @@
-Тесты не стал делать, уже к вечеру устал, сказали вручную писать всё, но в тз не было указано если чт, но я понимаю что тесты нужны тоже, не судите строго, спасибо!)
-
 # Payments
 
 Асинхронный сервис оплаты: HTTP API принимает платёж, в одной транзакции пишет `payments` + `outbox`, relay публикует в RabbitMQ, один consumer эмулирует эквайринг и вызывает webhook.
@@ -23,15 +21,27 @@ docker compose up --build
 
 ## Тесты
 
+Локально, unit на SQLite (`integration` пропускаются без `DATABASE_URL` / `RABBITMQ_URL`):
+
+Linux / macOS:
+
 ```bash
-python -m venv .venv
-.venv/Scripts/activate   # Windows
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt -r requirements-dev.txt
 pytest -q
 ```
 
-- `pytest -q` — unit на SQLite; integration пропускаются, если нет `DATABASE_URL` / `RABBITMQ_URL`
-- живые Postgres + RabbitMQ:
+Windows (PowerShell):
+
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt -r requirements-dev.txt
+pytest -q
+```
+
+Живые Postgres и RabbitMQ (Linux, macOS, Windows — нужен Docker):
 
 ```bash
 docker compose --profile test run --rm test
